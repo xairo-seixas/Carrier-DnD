@@ -1,0 +1,56 @@
+name: D&D Tariff Monthly Refresh
+
+# Save this file as .github/workflows/dnd_tariffs.yml in the repo.
+#
+# Runs once a month, in the same style as terminal-extractor's scheduled
+# workflow: install deps, run the script, done. The difference here is that
+# the script (run_monthly.py) reads AND writes a single fixed Google Drive
+# file in place each run - it downloads the current master workbook,
+# upserts newly scraped rows into it (appending new ones, refreshing only
+# the Contract end date on ones that already exist, skipping anything
+# marked "Manually Reviewed"), then re-uploads and verifies the round trip.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions),
+# same pattern as terminal_slot_scraper.py's GDRIVE_* secrets:
+#   GDRIVE_FILE_ID          - Drive file ID of the master workbook itself
+#                             (not a folder - this overwrites that one file)
+#   GDRIVE_CREDENTIALS_JSON - service account credentials JSON, shared with
+#                             (or copied from) the terminal-extractor's
+#                             GDRIVE_CREDENTIALS_JSON secret if it's the
+#                             same service account / Drive
+#
+# The service account needs Editor access on that specific Drive file
+# (share the file with the service account's email, same as any other
+# Drive-API automation).
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"  # 06:00 UTC on the 1st of every month
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monthly refresh
+        env:
+          GDRIVE_FILE_ID: ${{ secrets.GDRIVE_FILE_ID }}
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+        run: python run_monthly.py
+
+      - name: Upload run logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnd-tariff-run-output
+          path: output/
+          retention-days: 14
