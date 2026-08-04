@@ -372,38 +372,59 @@ def discover_hapag_lloyd(limit: int | None = None) -> list[TariffDoc]:
 MAERSK_INDEX_URL = "https://www.maersk.com/local-information"
 MAERSK_BASE = "https://www.maersk.com"
 
+# Confirmed by direct inspection (2026-08-04): the index page itself does
+# NOT list countries - it only links to these 5 region hub pages. Countries
+# are one level deeper, on each hub page, under a "Country/Region" heading.
+# (Verified: a plain fetch of MAERSK_INDEX_URL returns 200 with real content
+# from GitHub Actions too - Maersk isn't blocking us; the old code was just
+# looking for countries on the wrong page.)
+MAERSK_REGIONS = ["asia-pacific", "europe", "imea", "latin-america", "north-america"]
+
+# A region hub page also links to non-country pages that happen to match the
+# same /local-information/<segment>/<segment> shape (e.g.
+# north-america/ground-freight, a solutions page, not a country). Filter
+# those out by a keyword blocklist on the second segment.
+MAERSK_NON_COUNTRY_KEYWORDS = ("freight", "feeder", "route", "service", "solution", "logistics")
+
 
 def discover_maersk_countries() -> list[tuple[str, str, str]]:
     """Returns (region, country, country_url) tuples.
 
-    UNVERIFIED: written by analogy to MSC's index page. Maersk's local
-    information hub may be laid out differently (e.g. JS-driven region
-    picker) - if this returns zero countries, the index page needs to be
-    inspected directly (view-source) and this function rewritten.
+    Crawls each of the 5 known region hub pages (not the index page - see
+    MAERSK_REGIONS comment above) and pulls country links from each one's
+    "Country/Region" list. The region label is taken from the country's own
+    URL, not from which hub page it was found on - hub pages can cross-link
+    a country that actually belongs to a different region (e.g. Mexico is
+    listed on the North America hub page but its real URL is under
+    /local-information/latin-america/mexico).
     """
-    html = browser_get_html(MAERSK_INDEX_URL)
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/local-information/" not in href:
+    seen_urls: set[str] = set()
+    out: list[tuple[str, str, str]] = []
+    for region_slug in MAERSK_REGIONS:
+        hub_url = f"{MAERSK_BASE}/local-information/{region_slug}"
+        try:
+            html = browser_get_html(hub_url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [maersk] failed to load region hub {region_slug}: {exc}")
             continue
-        parts = [p for p in href.split("/local-information/")[-1].split("/") if p]
-        if len(parts) != 2:
-            continue  # expect <region>/<country> exactly
-        region, country_slug = parts
-        country = country_slug.replace("-", " ").title()
-        full_url = href if href.startswith("http") else f"{MAERSK_BASE}{href}"
-        out.append((region.replace("-", " ").title(), country, full_url))
-    # de-dupe
-    seen = set()
-    deduped = []
-    for row in out:
-        if row[2] in seen:
-            continue
-        seen.add(row[2])
-        deduped.append(row)
-    return deduped
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/local-information/" not in href:
+                continue
+            parts = [p for p in href.split("/local-information/")[-1].split("/") if p]
+            if len(parts) != 2:
+                continue  # expect <region>/<country> exactly
+            url_region, country_slug = parts
+            if any(kw in country_slug for kw in MAERSK_NON_COUNTRY_KEYWORDS):
+                continue  # a solutions/logistics page, not a country page
+            full_url = href if href.startswith("http") else f"{MAERSK_BASE}{href}"
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            country = country_slug.replace("-", " ").title()
+            out.append((url_region.replace("-", " ").title(), country, full_url))
+    return out
 
 
 def discover_maersk(limit: int | None = None) -> list[TariffDoc]:
@@ -508,17 +529,16 @@ def discover_msc(limit: int | None = None) -> list[TariffDoc]:
 # PDF download + best-effort table extraction (shared by all carriers)
 # ---------------------------------------------------------------------------
 
-def fetch_and_parse_pdf(doc: TariffDoc) -> None:
-    """Mutates doc in place: downloads the PDF, extracts tables/text."""
+def parse_pdf_bytes(doc: TariffDoc, pdf_bytes: bytes) -> None:
+    """Mutates doc in place: extracts tables/text from already-downloaded
+    PDF bytes. Split out from fetch_and_parse_pdf() so a manual-drop source
+    (a human-uploaded PDF pulled from a Drive folder, rather than fetched
+    live from a carrier's site) can reuse the exact same parsing path -
+    parse_cma_cgm() and friends only care about the PDF's own text content,
+    not where the bytes came from."""
     if pdfplumber is None:
         doc.status = "failed"
         doc.error = "pdfplumber not installed"
-        return
-    try:
-        pdf_bytes = browser_get_bytes(doc.pdf_url)
-    except Exception as exc:  # noqa: BLE001
-        doc.status = "failed"
-        doc.error = f"download failed: {exc}"
         return
     doc.status = "downloaded"
 
@@ -542,6 +562,26 @@ def fetch_and_parse_pdf(doc: TariffDoc) -> None:
     doc.effective_date_guess = guess_effective_date(doc.title, doc.raw_text[:2000])
     doc.validity_end_guess = guess_validity_end(doc.raw_text)
     doc.status = "parsed" if doc.tables else "parsed_no_tables"
+
+
+def fetch_and_parse_pdf(doc: TariffDoc) -> None:
+    """Mutates doc in place: downloads the PDF live from doc.pdf_url, then
+    parses it via parse_pdf_bytes(). Used for carriers whose sites we can
+    still reach directly (currently: Maersk). Not used for carriers behind
+    a Cloudflare/WAF block (CMA CGM) - those go through the manual-drop path
+    in run_monthly.py instead, which calls parse_pdf_bytes() directly on
+    bytes downloaded from a Drive folder."""
+    if pdfplumber is None:
+        doc.status = "failed"
+        doc.error = "pdfplumber not installed"
+        return
+    try:
+        pdf_bytes = browser_get_bytes(doc.pdf_url)
+    except Exception as exc:  # noqa: BLE001
+        doc.status = "failed"
+        doc.error = f"download failed: {exc}"
+        return
+    parse_pdf_bytes(doc, pdf_bytes)
 
 
 # ---------------------------------------------------------------------------
