@@ -562,10 +562,35 @@ def map_doc(doc) -> list[MappedRow]:
 
 FORMULA_CELL_REF_RE = re.compile(r"\b([A-Z]{1,2})2\b")
 
+# Columns that only ever have a value on a real data row (never on a merely
+# pre-formatted/blank one) - used to find where data actually ends.
+_DATA_PRESENCE_COLS = (1, 4)  # Type, Carrier
+
 
 def retarget_formula(formula: str, new_row: int) -> str:
     """Rewrites a row-2 formula (e.g. '=...D2...') to reference new_row instead."""
     return FORMULA_CELL_REF_RE.sub(lambda m: f"{m.group(1)}{new_row}", formula)
+
+
+def last_data_row(ws) -> int:
+    """openpyxl's ws.max_row reports the last row that has ANY cell touched
+    at all - including a cell that only has formatting/data-validation
+    applied but no actual value. BuyCo's template has styling/dropdowns
+    pre-applied roughly 1000 rows past the real data (normal for an Excel
+    template meant for future manual entry), so ws.max_row massively
+    overstates where the data actually ends. A real production run hit
+    exactly this: new rows landed ~1000 rows below the last real row
+    instead of right after it, because next_row was computed from
+    ws.max_row + 1.
+
+    This scans backward from ws.max_row and returns the last row where a
+    column that's only ever populated on a genuine data row (Type, Carrier)
+    actually has a value - i.e. the true last data row, formatting aside.
+    """
+    for r in range(ws.max_row, 1, -1):
+        if any(ws.cell(r, c).value not in (None, "") for c in _DATA_PRESENCE_COLS):
+            return r
+    return 1  # nothing but the header row has real data
 
 
 def write_template(template_path: Path, docs: list, out_path: Path) -> dict:
@@ -580,7 +605,7 @@ def write_template(template_path: Path, docs: list, out_path: Path) -> dict:
     r_formula = ws["R2"].value if ws["R2"].value and str(ws["R2"].value).startswith("=") else None
     s_formula = ws["S2"].value if ws["S2"].value and str(ws["S2"].value).startswith("=") else None
 
-    next_row = ws.max_row + 1
+    next_row = last_data_row(ws) + 1
     review_rows = []
     total = 0
 
@@ -704,7 +729,8 @@ def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
     # already has a row" and skips outright, rather than not finding it and
     # appending a silent duplicate next to the one a human already fixed.
     existing_index: dict[tuple, int] = {}
-    for r in range(2, ws.max_row + 1):
+    last_row = last_data_row(ws)
+    for r in range(2, last_row + 1):
         type_ = ws.cell(r, 1).value
         container_type = ws.cell(r, 2).value
         pol = ws.cell(r, 8).value
@@ -716,7 +742,7 @@ def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
         port = pod if type_ == "Destination" else pol
         existing_index[(carrier, type_, port, penalty_type, container_type)] = r
 
-    next_row = ws.max_row + 1
+    next_row = last_row + 1
     appended = 0
     updated = 0
     skipped_manual = 0
