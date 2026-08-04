@@ -154,32 +154,50 @@ def browser_get_html(url: str) -> str:
          specifically (a different mechanism than the IP-based 403 from
          stage 1) - not a wait-timing problem.
 
-    Stage 4 (current): fetch via the browser context's request API
-    (ctx.request.get) instead of a full page navigation. This still goes
-    out over Chromium's real TLS/HTTP fingerprint (so it should keep the
-    stage-1 fix - no more bare-Python-client 403s), but never opens a page
-    or runs any JS - so there's no DOM for a headless-detection script to
-    rewrite or hide content from. This matches what the direct verification
-    fetch did (no JS, full content) and is also faster than a real render.
-    Falls back to a real page.goto() navigation only if the request itself
-    comes back blocked (4xx/5xx) - that's the stage-1-style failure mode a
-    full browser page load can sometimes get past that a bare request can't.
+    Stage 4: fetched via the browser context's request API (ctx.request.get)
+    instead of a full page navigation - still Chromium's real TLS/HTTP
+    fingerprint, no JS/DOM for a headless-detection script to touch. Also
+    came back empty (0 documents), with no error, and *faster* than stage 3
+    - meaning it succeeded on the request path, not the page-nav fallback.
+    So two completely different fetch mechanisms (real page render, bare
+    context request) both return "successful, empty" from inside GitHub
+    Actions, while a direct fetch of the exact same URLs from outside GitHub
+    Actions returns the real, full content. That combination - no error,
+    but silently different/empty content, specifically from that network -
+    smells like a soft block keyed on the requesting IP/network (GitHub
+    Actions' runner ranges are well-known and can be denylisted or served a
+    stripped placeholder rather than a hard 4xx, precisely so the caller
+    can't tell it was blocked). Guessing another fetch mechanism blindly
+    isn't productive without seeing what's actually coming back - so stage 5
+    is diagnostic, not a fix: log the status, byte length, and a content
+    snippet for every fetch so the next real run tells us what GitHub
+    Actions' IP is actually being served.
     """
     time.sleep(REQUEST_DELAY_S)
     ctx = _get_browser_context()
 
+    def _log(via: str, status, html: str) -> None:
+        snippet = " ".join(html.split())[:200] if html else "(empty)"
+        print(f"    [fetch:{via}] {url}\n"
+              f"      status={status} bytes={len(html)}\n"
+              f"      snippet={snippet!r}")
+
     try:
         resp = ctx.request.get(url, timeout=45000)
+        html = resp.text()
+        _log("request", resp.status, html)
         if resp.status < 400:
-            return resp.text()
-    except Exception:
-        pass  # fall through to a full page-render attempt below
+            return html
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [fetch:request] {url}\n      EXCEPTION: {exc}")
 
     page = ctx.new_page()
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(2000)  # let head-of-page bot checks settle
-        return page.content()
+        html = page.content()
+        _log("page", resp.status if resp else "N/A", html)
+        return html
     finally:
         page.close()
 
