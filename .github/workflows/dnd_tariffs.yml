@@ -53,6 +53,7 @@ jobs:
         env:
           GDRIVE_FILE_ID: ${{ secrets.GDRIVE_FILE_ID }}
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
+          CMA_CGM_MANUAL_FOLDER_ID: ${{ secrets.CMA_CGM_MANUAL_FOLDER_ID }}
         run: python run_monthly.py
 
       - name: Upload run logs on failure
