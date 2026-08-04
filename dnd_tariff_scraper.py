@@ -130,12 +130,38 @@ def _get_browser_context():
 
 
 def browser_get_html(url: str) -> str:
-    """Loads a page in a real browser and returns its rendered HTML."""
+    """Loads a page in a real browser and returns its rendered HTML.
+
+    Uses wait_until="domcontentloaded" rather than "networkidle". Two real
+    problems showed up with networkidle against these specific carrier sites:
+
+      1. Hapag-Lloyd and Maersk never reach network-idle at all - they run
+         continuous background polling (analytics/GTM, chat widgets,
+         personalization pixels) that keeps at least one request in flight
+         indefinitely, so the 45s wait always times out. This was the
+         "Page.goto: Timeout 45000ms exceeded" failure.
+      2. CMA CGM's and MSC's country/tariff listings are server-rendered -
+         present in the raw HTML the very first millisecond the page loads.
+         Waiting for the page to go fully idle gives their client-side JS
+         framework time to hydrate and re-render that same listing from a
+         follow-up API call - and while that call is in flight (or if it's
+         slow/blocked), the listing is briefly or permanently empty. That's
+         the "Discovered 0 document(s)" failure with no error at all: the
+         page loaded fine, we just captured it after the content had already
+         been wiped for a client-side re-render.
+
+    domcontentloaded fires right after the initial HTML is parsed - fast,
+    always resolves, and captures the server-rendered content before any
+    hydration has a chance to touch it. A short fixed settle delay is added
+    on top so any synchronous bot-check script in <head> still gets a chance
+    to run before we read the DOM.
+    """
     time.sleep(REQUEST_DELAY_S)
     ctx = _get_browser_context()
     page = ctx.new_page()
     try:
-        page.goto(url, wait_until="networkidle", timeout=45000)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)  # let head-of-page bot checks settle
         return page.content()
     finally:
         page.close()
