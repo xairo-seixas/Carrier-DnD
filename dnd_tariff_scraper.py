@@ -97,6 +97,71 @@ def polite_get(url: str, **kwargs) -> requests.Response:
     return resp
 
 
+# ---------------------------------------------------------------------------
+# Browser-based fetching (Playwright) - plain requests.get() was getting
+# 403'd on cma_cgm/hapag_lloyd/msc from GitHub Actions' IPs (their bot
+# protection can fingerprint a bare HTTP client and/or blocklist known
+# cloud-runner IP ranges). A real headless browser has a legitimate
+# TLS/JS/HTTP fingerprint that passes those checks - this mirrors the
+# approach terminal-extractor already uses for the same reason.
+#
+# One browser context is reused for the whole run (not per-request) so we
+# aren't paying browser-launch cost per page, and so any session cookie a
+# site's challenge sets while loading its HTML carries over to later
+# requests (including PDF downloads) in the same run.
+# ---------------------------------------------------------------------------
+
+_browser_playwright = None
+_browser_instance = None
+_browser_context = None
+
+
+def _get_browser_context():
+    global _browser_playwright, _browser_instance, _browser_context
+    if _browser_context is None:
+        from playwright.sync_api import sync_playwright
+        _browser_playwright = sync_playwright().start()
+        _browser_instance = _browser_playwright.chromium.launch(headless=True)
+        _browser_context = _browser_instance.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1366, "height": 900},
+        )
+    return _browser_context
+
+
+def browser_get_html(url: str) -> str:
+    """Loads a page in a real browser and returns its rendered HTML."""
+    time.sleep(REQUEST_DELAY_S)
+    ctx = _get_browser_context()
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="networkidle", timeout=45000)
+        return page.content()
+    finally:
+        page.close()
+
+
+def browser_get_bytes(url: str) -> bytes:
+    """Downloads binary content (e.g. a PDF) via the same browser context's
+    session/cookies, using Playwright's request API rather than a full page
+    navigation (faster, and works for non-HTML responses)."""
+    time.sleep(REQUEST_DELAY_S)
+    ctx = _get_browser_context()
+    resp = ctx.request.get(url)
+    if resp.status >= 400:
+        raise RuntimeError(f"HTTP {resp.status} for {url}")
+    return resp.body()
+
+
+def close_browser() -> None:
+    global _browser_playwright, _browser_instance, _browser_context
+    if _browser_instance is not None:
+        _browser_instance.close()
+    if _browser_playwright is not None:
+        _browser_playwright.stop()
+    _browser_instance = _browser_context = _browser_playwright = None
+
+
 DATE_IN_TEXT = re.compile(
     r"(?:effective\s+)?(\d{1,2}[\s\-/](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*[\s\-/]\d{2,4}"
     r"|\d{4}-\d{2}-\d{2}"
@@ -149,8 +214,8 @@ CMA_CGM_INDEX_URL = "https://www.cma-cgm.com/ebusiness/tariffs/demurrage-detenti
 
 
 def discover_cma_cgm(limit: int | None = None) -> list[TariffDoc]:
-    resp = polite_get(CMA_CGM_INDEX_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = browser_get_html(CMA_CGM_INDEX_URL)
+    soup = BeautifulSoup(html, "html.parser")
     docs: list[TariffDoc] = []
     current_region = "Unknown"
 
@@ -217,11 +282,11 @@ def discover_hapag_lloyd(limit: int | None = None) -> list[TariffDoc]:
     for region in HAPAG_REGIONS:
         url = f"{HAPAG_BASE}/{region}.html"
         try:
-            resp = polite_get(url)
-        except requests.RequestException as exc:
+            html = browser_get_html(url)
+        except Exception as exc:  # noqa: BLE001 - Playwright raises its own error types
             print(f"    [hapag_lloyd] failed to load region {region}: {exc}")
             continue
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href.lower().endswith(".pdf"):
@@ -255,8 +320,8 @@ def discover_maersk_countries() -> list[tuple[str, str, str]]:
     picker) - if this returns zero countries, the index page needs to be
     inspected directly (view-source) and this function rewritten.
     """
-    resp = polite_get(MAERSK_INDEX_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = browser_get_html(MAERSK_INDEX_URL)
+    soup = BeautifulSoup(html, "html.parser")
     out = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -291,10 +356,10 @@ def discover_maersk(limit: int | None = None) -> list[TariffDoc]:
         for direction in ("import", "export"):
             url = f"{country_url}/{direction}"
             try:
-                resp = polite_get(url)
-            except requests.RequestException:
+                html = browser_get_html(url)
+            except Exception:  # noqa: BLE001
                 continue  # not every country publishes both directions
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if not href.lower().endswith(".pdf"):
@@ -324,8 +389,8 @@ MSC_BASE = "https://www.msc.com"
 
 
 def discover_msc_countries() -> list[tuple[str, str, str]]:
-    resp = polite_get(MSC_INDEX_URL)
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = browser_get_html(MSC_INDEX_URL)
+    soup = BeautifulSoup(html, "html.parser")
     out = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -353,11 +418,11 @@ def discover_msc(limit: int | None = None) -> list[TariffDoc]:
     docs: list[TariffDoc] = []
     for region, country, country_url in countries:
         try:
-            resp = polite_get(country_url)
-        except requests.RequestException as exc:
+            html = browser_get_html(country_url)
+        except Exception as exc:  # noqa: BLE001
             print(f"    [msc] failed to load {country}: {exc}")
             continue
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href.lower().endswith(".pdf"):
@@ -389,15 +454,15 @@ def fetch_and_parse_pdf(doc: TariffDoc) -> None:
         doc.error = "pdfplumber not installed"
         return
     try:
-        resp = polite_get(doc.pdf_url)
-    except requests.RequestException as exc:
+        pdf_bytes = browser_get_bytes(doc.pdf_url)
+    except Exception as exc:  # noqa: BLE001
         doc.status = "failed"
         doc.error = f"download failed: {exc}"
         return
     doc.status = "downloaded"
 
     try:
-        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             all_text = []
             for page in pdf.pages:
                 for table in (page.extract_tables() or []):
@@ -511,28 +576,31 @@ def main() -> int:
     all_docs: list[TariffDoc] = []
     failures: list[str] = []
 
-    for carrier in args.carriers:
-        print(f"\n── {carrier} ──")
-        try:
-            docs = CARRIERS[carrier](args.sample)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ✗ FAILED discovery — {exc}")
-            failures.append(f"{carrier}: discovery failed: {exc}")
-            continue
+    try:
+        for carrier in args.carriers:
+            print(f"\n── {carrier} ──")
+            try:
+                docs = CARRIERS[carrier](args.sample)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ✗ FAILED discovery — {exc}")
+                failures.append(f"{carrier}: discovery failed: {exc}")
+                continue
 
-        print(f"  Discovered {len(docs)} document(s)")
-        if not args.skip_pdf_parse:
-            for i, doc in enumerate(docs, 1):
-                fetch_and_parse_pdf(doc)
-                if doc.status == "failed":
-                    print(f"    [{i}/{len(docs)}] ✗ {doc.country} — {doc.title}: {doc.error}")
-                else:
-                    print(f"    [{i}/{len(docs)}] ✓ {doc.country} — {doc.title} "
-                          f"({len(doc.tables)} table(s))")
-        all_docs.extend(docs)
+            print(f"  Discovered {len(docs)} document(s)")
+            if not args.skip_pdf_parse:
+                for i, doc in enumerate(docs, 1):
+                    fetch_and_parse_pdf(doc)
+                    if doc.status == "failed":
+                        print(f"    [{i}/{len(docs)}] ✗ {doc.country} — {doc.title}: {doc.error}")
+                    else:
+                        print(f"    [{i}/{len(docs)}] ✓ {doc.country} — {doc.title} "
+                              f"({len(doc.tables)} table(s))")
+            all_docs.extend(docs)
 
-        if not docs:
-            failures.append(f"{carrier}: 0 documents discovered — index parser likely needs fixing")
+            if not docs:
+                failures.append(f"{carrier}: 0 documents discovered — index parser likely needs fixing")
+    finally:
+        close_browser()  # always shut the headless browser down, even on failure
 
     write_outputs(all_docs, args.out)
 

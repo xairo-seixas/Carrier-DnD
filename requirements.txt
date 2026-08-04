@@ -6,3 +6,4 @@ openpyxl
 python-dateutil
 google-auth
 google-api-python-client
+playwright

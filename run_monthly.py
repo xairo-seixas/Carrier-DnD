@@ -42,7 +42,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 import buyco_mapper
-from dnd_tariff_scraper import CARRIERS, fetch_and_parse_pdf
+from dnd_tariff_scraper import CARRIERS, fetch_and_parse_pdf, close_browser
 
 WORK_DIR = Path(__file__).parent / "output"
 DOWNLOADED_MASTER = WORK_DIR / "master_downloaded.xlsx"
@@ -87,22 +87,25 @@ def upload_master(svc, file_id: str, path: Path, verify: bool = True) -> None:
 def scrape_all_carriers() -> tuple[list, list[str]]:
     all_docs = []
     failures = []
-    for carrier, discover_fn in CARRIERS.items():
-        print(f"\n── {carrier} ──")
-        try:
-            docs = discover_fn(None)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ✗ discovery failed: {exc}")
-            failures.append(f"{carrier}: discovery failed: {exc}")
-            continue
-        print(f"  Discovered {len(docs)} document(s)")
-        for i, doc in enumerate(docs, 1):
-            fetch_and_parse_pdf(doc)
-            status = "✓" if doc.status != "failed" else "✗"
-            print(f"    [{i}/{len(docs)}] {status} {doc.country} — {doc.title}")
-        all_docs.extend(docs)
-        if not docs:
-            failures.append(f"{carrier}: 0 documents discovered this run")
+    try:
+        for carrier, discover_fn in CARRIERS.items():
+            print(f"\n── {carrier} ──")
+            try:
+                docs = discover_fn(None)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ✗ discovery failed: {exc}")
+                failures.append(f"{carrier}: discovery failed: {exc}")
+                continue
+            print(f"  Discovered {len(docs)} document(s)")
+            for i, doc in enumerate(docs, 1):
+                fetch_and_parse_pdf(doc)
+                status = "✓" if doc.status != "failed" else "✗"
+                print(f"    [{i}/{len(docs)}] {status} {doc.country} — {doc.title}")
+            all_docs.extend(docs)
+            if not docs:
+                failures.append(f"{carrier}: 0 documents discovered this run")
+    finally:
+        close_browser()  # always shut the headless browser down, even on failure
     return all_docs, failures
 
 
