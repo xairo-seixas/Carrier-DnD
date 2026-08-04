@@ -22,6 +22,11 @@ name: D&D Tariff Monthly Refresh
 # The service account needs Editor access on that specific Drive file
 # (share the file with the service account's email, same as any other
 # Drive-API automation).
+#
+# Uses a real headless browser (Playwright/Chromium) to fetch carrier pages
+# instead of plain HTTP requests - cma_cgm/hapag_lloyd/msc all 403'd bare
+# requests.get() calls from GitHub Actions' IPs (bot protection), so this
+# installs Chromium in CI the same way terminal-extractor's workflow does.
 
 on:
   schedule:
@@ -40,6 +45,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Playwright's Chromium
+        run: playwright install --with-deps chromium
 
       - name: Run monthly refresh
         env:
