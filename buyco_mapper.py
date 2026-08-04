@@ -270,10 +270,236 @@ def resolve_ports(country: str, raw_text: str) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# CMA CGM - structured parser (calibrated against real fetched PDFs: France
+# and US, 2026-08-04). CMA's tariff PDFs follow a stable nested template:
+#
+#   D&D TARIFFS <COUNTRY>
+#   IMPORT|EXPORT - <PLACE DESCRIPTION> [(UNLOCODE)]
+#   TARIFF IN <CURRENCY WORD, e.g. EURO/USD>
+#   ...
+#   EFFECTIVE DATE*: <DD-MON-YYYY>
+#   EXPIRATION DATE: <DD-MON-YYYY | UNTIL FURTHER NOTICE>
+#   ...
+#   <STANDARD|NOR CONTAINER|REEFER CONTAINER|SPECIAL CONTAINER|HAZARDOUS|TK> - SPLITTED
+#   DEMURRAGE [DETENTION] | DETENTION | STORAGE
+#   SLAB/TIER (in days) 20' 40' 45' [SLAB/TIER (in days) 20' 40' 45']
+#   <N> FREE DAY(S) [<N> FREE DAY(S)]
+#   From <ord> To <ord> <r20> <r40> <r45> [From <ord> To <ord> <r20> <r40> <r45>]
+#   From <ord> Onwards <r20> <r40> <r45> [...]
+#   ... (repeats for each container-type block, then repeats for each place)
+#
+# One PDF can contain many place-blocks (one per port/region) and each
+# place-block can contain several container-type blocks, each of which can
+# cover Demurrage and Detention side by side on the same lines. This walks
+# the text top-to-bottom as a small state machine instead of one flat
+# regex, since the structure genuinely nests three levels deep and a flat
+# regex can't tell which numbers belong to which (port, container
+# type/size, penalty type) combination.
+#
+# NOT yet verified against every CMA country - only France and US. Other
+# countries may phrase tiers slightly differently (e.g. "Until Day X"
+# instead of "To Xth"); anything this can't parse is flagged in QA Notes
+# rather than silently dropped, so gaps stay visible.
+# ---------------------------------------------------------------------------
+
+CMA_PLACE_HEADER_RE = re.compile(r"^\s*(IMPORT|EXPORT)\s*[-–]\s*(.+?)\s*$", re.IGNORECASE)
+CMA_CONTAINER_HEADER_RE = re.compile(
+    r"^\s*(STANDARD|NOR CONTAINER|REEFER CONTAINER|SPECIAL CONTAINER|HAZARDOUS|TK)\s*-\s*SPLITTED\s*$",
+    re.IGNORECASE,
+)
+CMA_PENALTY_HEADER_RE = re.compile(
+    r"^\s*(DEMURRAGE|DETENTION|STORAGE)(?:\s+(DEMURRAGE|DETENTION|STORAGE))?\s*$", re.IGNORECASE
+)
+CMA_CURRENCY_RE = re.compile(r"TARIFF IN\s+([A-Z]+)", re.IGNORECASE)
+CMA_EFFECTIVE_RE = re.compile(r"EFFECTIVE DATE\*?:\s*([\d]{1,2}[-\s][A-Za-z]{3}[-\s][\d]{2,4})", re.IGNORECASE)
+CMA_EXPIRATION_RE = re.compile(r"EXPIRATION DATE:\s*(.+)", re.IGNORECASE)
+CMA_NAMED_PORT_RE = re.compile(r"\(([A-Z]{5})\)")
+CMA_FREE_DAYS_RE = re.compile(r"(\d{1,3})\s*(?:CALENDAR\s+)?FREE\s+DAYS?", re.IGNORECASE)
+CMA_TIER_FRAGMENT_RE = re.compile(
+    r"From\s+(\d{1,3})(?:st|nd|rd|th)?\s+(?:To\s+(\d{1,3})(?:st|nd|rd|th)?|Onwards)\s+"
+    r"([\d.]+)\s+([\d.]+)\s+([\d.]+)",
+    re.IGNORECASE,
+)
+
+CMA_CURRENCY_ALIASES = {"EURO": "EUR", "USED": "USD"}
+
+# Matches BuyCo's actual Sheet3 taxonomy (DV/HC/RFR, 20DV/40DV/40HC/20RFR/40RFR
+# - no 45' entries). Per BuyCo's call:
+#   - 45' is dropped entirely (only indices 0/1 -> 20'/40' are ever read;
+#     whatever the source's 45' column says is discarded, even when it
+#     differs from 40', e.g. some NY/NJ lines)
+#   - NOR CONTAINER (a reefer run as a standard box, per the source's own
+#     description) maps to DV codes, not RFR
+#   - SPECIAL CONTAINER (open tops/flat racks) and TK (tanks) both map to
+#     TK codes, sized (20TK/40TK isn't in Sheet3 yet - add it there, or
+#     tell me to rename these strings, if it should be unsized "TK" instead)
+CMA_CONTAINER_SIZE_CODES = {
+    "STANDARD": ["20DV", "40DV"],
+    "NOR CONTAINER": ["20DV", "40DV"],
+    "REEFER CONTAINER": ["20RFR", "40RFR"],
+    "SPECIAL CONTAINER": ["20TK", "40TK"],
+    "HAZARDOUS": ["20DV", "40DV"],
+    "TK": ["20TK", "40TK"],
+}
+
+
+def parse_cma_cgm(doc) -> list[MappedRow]:
+    raw_text = getattr(doc, "raw_text", "") or ""
+    carrier = getattr(doc, "carrier", "") or ""
+    country = getattr(doc, "country", "") or ""
+    pdf_url = getattr(doc, "pdf_url", "") or ""
+    title = getattr(doc, "title", "") or ""
+    lines = raw_text.splitlines()
+
+    # Pre-scan: every UNLOCODE named anywhere in this doc gets its own
+    # place-block already, so a later "ALL PORTS EXCEPT..." fanout
+    # shouldn't duplicate them with a second, more generic row.
+    all_named_ports = set(CMA_NAMED_PORT_RE.findall(raw_text))
+
+    rows: list[MappedRow] = []
+
+    direction = None
+    place_desc = ""
+    named_port = ""
+    currency = ""
+    effective = getattr(doc, "effective_date_guess", "") or ""
+    expiration = getattr(doc, "validity_end_guess", "") or ""
+
+    container_header = ""
+    penalty_types: list[str] = []
+    free_days: dict[str, int] = {}
+    tiers: dict[str, list[tuple[float, float, float, Optional[int]]]] = {}
+
+    def flush_container_block():
+        if not penalty_types or direction is None:
+            return
+        codes = CMA_CONTAINER_SIZE_CODES.get(container_header, ["20DV", "40DV"])
+        hazardous = "T" if container_header == "HAZARDOUS" else "F"
+
+        if named_port:
+            target_ports = [named_port]
+            port_notes = []
+        else:
+            ref_ports = [c for c, _ in get_ports_for_country(country) if c not in all_named_ports]
+            if ref_ports:
+                target_ports = ref_ports
+                port_notes = [f"'{place_desc}' doesn't name a specific port - fanned out across "
+                              f"{len(ref_ports)} reference port(s) for {country}, excluding any "
+                              f"port already named elsewhere in this same PDF."]
+            else:
+                target_ports = [""]
+                port_notes = [f"'{place_desc}' doesn't name a specific port and no usable port "
+                              f"reference for {country} - POL/POD left blank, needs manual mapping."]
+
+        for penalty_type in penalty_types:
+            ft = free_days.get(penalty_type)
+            tier_list = tiers.get(penalty_type, [])
+            base_notes = list(port_notes)
+            if ft is None:
+                base_notes.append(f"No free-day count parsed for {penalty_type} in this block.")
+            if not tier_list:
+                base_notes.append(f"No rate tiers parsed for {penalty_type} in this block.")
+            for target_port in target_ports:
+                for size_idx, code in enumerate(codes):
+                    row = MappedRow(
+                        type_=direction,
+                        container_type=code,
+                        hazardous=hazardous,
+                        carrier=carrier,
+                        penalty_type=penalty_type,
+                        currency=currency,
+                        free_time=ft,
+                        contract_start=effective,
+                        contract_end="" if expiration.upper() == "UNTIL FURTHER NOTICE" else expiration,
+                        qa_notes=list(base_notes),
+                        source_title=title,
+                        source_pdf=pdf_url,
+                    )
+                    if direction == "Destination":
+                        row.pod = target_port
+                    else:
+                        row.pol = target_port
+                    for tier_i, tier in enumerate(tier_list[:3]):
+                        r20, r40, r45, period = tier
+                        rate = {0: r20, 1: r40, 2: r45}[size_idx]
+                        if tier_i == 0:
+                            row.penalty1, row.period1 = rate, period
+                        elif tier_i == 1:
+                            row.penalty2, row.period2 = rate, period
+                        elif tier_i == 2:
+                            row.penalty3 = rate
+                    rows.append(row)
+
+    for line in lines:
+        line = line.strip()
+
+        m = CMA_PLACE_HEADER_RE.match(line)
+        if m:
+            flush_container_block()
+            container_header, penalty_types, free_days, tiers = "", [], {}, {}
+            direction = "Destination" if m.group(1).upper() == "IMPORT" else "Origin"
+            place_desc = m.group(2)
+            port_m = CMA_NAMED_PORT_RE.search(place_desc)
+            named_port = port_m.group(1) if port_m else ""
+            continue
+
+        cm = CMA_CURRENCY_RE.search(line)
+        if cm:
+            token = cm.group(1).upper()
+            currency = CMA_CURRENCY_ALIASES.get(token, token)
+
+        em = CMA_EFFECTIVE_RE.search(line)
+        if em:
+            effective = em.group(1)
+
+        xm = CMA_EXPIRATION_RE.search(line)
+        if xm:
+            expiration = xm.group(1).strip()
+
+        ch = CMA_CONTAINER_HEADER_RE.match(line)
+        if ch:
+            flush_container_block()
+            container_header = ch.group(1).upper()
+            penalty_types, free_days, tiers = [], {}, {}
+            continue
+
+        ph = CMA_PENALTY_HEADER_RE.match(line)
+        if ph and container_header:
+            penalty_types = [g.title() for g in ph.groups() if g]
+            continue
+
+        if penalty_types:
+            free_matches = list(CMA_FREE_DAYS_RE.finditer(line))
+            for idx, fm in enumerate(free_matches[:len(penalty_types)]):
+                free_days[penalty_types[idx]] = int(fm.group(1))
+
+            tier_matches = list(CMA_TIER_FRAGMENT_RE.finditer(line))
+            for idx, tm in enumerate(tier_matches[:len(penalty_types)]):
+                start, end = tm.group(1), tm.group(2)
+                period = (int(end) - int(start) + 1) if end else None
+                r20, r40, r45 = float(tm.group(3)), float(tm.group(4)), float(tm.group(5))
+                tiers.setdefault(penalty_types[idx], []).append((r20, r40, r45, period))
+
+    flush_container_block()
+
+    if not rows:
+        rows.append(MappedRow(
+            type_="Origin", carrier=carrier, penalty_type="D&D",
+            source_title=title, source_pdf=pdf_url,
+            qa_notes=["parse_cma_cgm found no place/container-type blocks at all - this "
+                      "document's wording doesn't match the France/US pattern this parser "
+                      "was built against. Needs a look at the actual PDF."],
+        ))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main per-document mapper
 # ---------------------------------------------------------------------------
 
 def map_doc(doc) -> list[MappedRow]:
+    if getattr(doc, "carrier", "") == "CMA CGM":
+        return parse_cma_cgm(doc)
     title = getattr(doc, "title", "") or ""
     raw_text = getattr(doc, "raw_text", "") or ""
     country = getattr(doc, "country", "") or ""
@@ -442,8 +668,12 @@ def parse_date_best_effort(value) -> Optional["__import__('datetime').date"]:
 
 
 def row_key(mrow: "MappedRow") -> tuple:
+    # Container type is part of the identity now that CMA rows are split per
+    # size/equipment type (20DV vs 40DV vs 20RFR, etc.) - without it, two
+    # rows for the same port/penalty that only differ by size would look
+    # identical to the matcher and collide.
     port = mrow.pod if mrow.type_ == "Destination" else mrow.pol
-    return (mrow.carrier, mrow.type_, port, mrow.penalty_type)
+    return (mrow.carrier, mrow.type_, port, mrow.penalty_type, mrow.container_type)
 
 
 def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
@@ -476,6 +706,7 @@ def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
     existing_index: dict[tuple, int] = {}
     for r in range(2, ws.max_row + 1):
         type_ = ws.cell(r, 1).value
+        container_type = ws.cell(r, 2).value
         pol = ws.cell(r, 8).value
         pod = ws.cell(r, 9).value
         penalty_type = ws.cell(r, 15).value
@@ -483,7 +714,7 @@ def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
         if not type_ or not carrier:
             continue
         port = pod if type_ == "Destination" else pol
-        existing_index[(carrier, type_, port, penalty_type)] = r
+        existing_index[(carrier, type_, port, penalty_type, container_type)] = r
 
     next_row = ws.max_row + 1
     appended = 0
