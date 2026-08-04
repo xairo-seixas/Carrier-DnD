@@ -130,34 +130,51 @@ def _get_browser_context():
 
 
 def browser_get_html(url: str) -> str:
-    """Loads a page in a real browser and returns its rendered HTML.
+    """Fetches a page's HTML through the browser context.
 
-    Uses wait_until="domcontentloaded" rather than "networkidle". Two real
-    problems showed up with networkidle against these specific carrier sites:
+    History of this function, because the fix at each stage only made sense
+    in light of what the previous one actually did in production:
 
-      1. Hapag-Lloyd and Maersk never reach network-idle at all - they run
-         continuous background polling (analytics/GTM, chat widgets,
-         personalization pixels) that keeps at least one request in flight
-         indefinitely, so the 45s wait always times out. This was the
-         "Page.goto: Timeout 45000ms exceeded" failure.
-      2. CMA CGM's and MSC's country/tariff listings are server-rendered -
-         present in the raw HTML the very first millisecond the page loads.
-         Waiting for the page to go fully idle gives their client-side JS
-         framework time to hydrate and re-render that same listing from a
-         follow-up API call - and while that call is in flight (or if it's
-         slow/blocked), the listing is briefly or permanently empty. That's
-         the "Discovered 0 document(s)" failure with no error at all: the
-         page loaded fine, we just captured it after the content had already
-         been wiped for a client-side re-render.
+      1. Started as plain requests.get() - got 403'd on cma_cgm/hapag_lloyd/
+         msc from GitHub Actions' IPs (bot protection fingerprinting a bare
+         HTTP client + flagged cloud-runner IP ranges).
+      2. Switched to a full Playwright page.goto(..., wait_until="networkidle")
+         - fixed the 403s, but Hapag-Lloyd/Maersk then timed out every time:
+         those sites run continuous background polling (GTM, chat widgets,
+         personalization) that never lets the network go idle.
+      3. Switched the wait to "domcontentloaded" - fixed the timeouts, but
+         cma_cgm/hapag_lloyd/msc all came back with "Discovered 0
+         document(s)" and no error. The real run showed this wasn't a
+         timing issue: verified directly (via a plain, non-JS fetch of the
+         live pages) that CMA CGM's and MSC's country/tariff listings ARE
+         present in the raw server-rendered HTML - full, complete, no JS
+         needed. Yet a real headless-Chromium *page* render of the same URL
+         comes back without that listing. That points at the sites hiding
+         content from an automated/headless browser at the JS/DOM level
+         specifically (a different mechanism than the IP-based 403 from
+         stage 1) - not a wait-timing problem.
 
-    domcontentloaded fires right after the initial HTML is parsed - fast,
-    always resolves, and captures the server-rendered content before any
-    hydration has a chance to touch it. A short fixed settle delay is added
-    on top so any synchronous bot-check script in <head> still gets a chance
-    to run before we read the DOM.
+    Stage 4 (current): fetch via the browser context's request API
+    (ctx.request.get) instead of a full page navigation. This still goes
+    out over Chromium's real TLS/HTTP fingerprint (so it should keep the
+    stage-1 fix - no more bare-Python-client 403s), but never opens a page
+    or runs any JS - so there's no DOM for a headless-detection script to
+    rewrite or hide content from. This matches what the direct verification
+    fetch did (no JS, full content) and is also faster than a real render.
+    Falls back to a real page.goto() navigation only if the request itself
+    comes back blocked (4xx/5xx) - that's the stage-1-style failure mode a
+    full browser page load can sometimes get past that a bare request can't.
     """
     time.sleep(REQUEST_DELAY_S)
     ctx = _get_browser_context()
+
+    try:
+        resp = ctx.request.get(url, timeout=45000)
+        if resp.status < 400:
+            return resp.text()
+    except Exception:
+        pass  # fall through to a full page-render attempt below
+
     page = ctx.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
