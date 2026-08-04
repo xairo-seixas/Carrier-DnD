@@ -381,10 +381,30 @@ MAERSK_BASE = "https://www.maersk.com"
 MAERSK_REGIONS = ["asia-pacific", "europe", "imea", "latin-america", "north-america"]
 
 # A region hub page also links to non-country pages that happen to match the
-# same /local-information/<segment>/<segment> shape (e.g.
-# north-america/ground-freight, a solutions page, not a country). Filter
-# those out by a keyword blocklist on the second segment.
+# same /local-information/<segment>/<segment> shape - "Routes to/from" links
+# (shipping-from-north-america-to-europe/med-canada-express-eastbound) and
+# feeder-route links (europe-feeder-shipping-routes/n03) are two segments
+# too. A keyword blocklist on the second segment alone doesn't catch these -
+# the giveaway noise word ("feeder", "shipping-from", ...) is often in the
+# FIRST segment, and route/service names in the second segment (e.g.
+# "med-canada-express-eastbound") don't look like noise at all on their own.
+# Rather than keep extending a blocklist, whitelist the first segment
+# instead: a real country link's first segment is always one of the 5
+# known region slugs; every route/service/solutions link's first segment is
+# some longer compound string that never matches one of those 5 exactly.
+# That alone still lets through same-region solutions links like
+# north-america/ground-freight (a valid region + a non-country second
+# segment), so a small keyword check on the second segment stays too - just
+# as a second layer, not the primary filter.
+_MAERSK_REGION_SLUGS = set(MAERSK_REGIONS)
 MAERSK_NON_COUNTRY_KEYWORDS = ("freight", "feeder", "route", "service", "solution", "logistics")
+
+# Hard safety cap: there are ~150-200 countries worldwide, so legitimate
+# discovery should never come close to this. If a future page-structure
+# change lets noise links back through, this stops the crawl from silently
+# running for hours (a single earlier bug here caused ~900+ garbage fetches
+# before it was caught) instead of just failing fast and loud.
+MAERSK_MAX_COUNTRIES = 300
 
 
 def discover_maersk_countries() -> list[tuple[str, str, str]]:
@@ -416,14 +436,22 @@ def discover_maersk_countries() -> list[tuple[str, str, str]]:
             if len(parts) != 2:
                 continue  # expect <region>/<country> exactly
             url_region, country_slug = parts
-            if any(kw in country_slug for kw in MAERSK_NON_COUNTRY_KEYWORDS):
-                continue  # a solutions/logistics page, not a country page
+            if url_region.lower() not in _MAERSK_REGION_SLUGS:
+                continue  # a route/service/solutions link, not a country page
+            if any(kw in country_slug.lower() for kw in MAERSK_NON_COUNTRY_KEYWORDS):
+                continue  # same-region solutions link (e.g. north-america/ground-freight)
             full_url = href if href.startswith("http") else f"{MAERSK_BASE}{href}"
             if full_url in seen_urls:
                 continue
             seen_urls.add(full_url)
             country = country_slug.replace("-", " ").title()
             out.append((url_region.replace("-", " ").title(), country, full_url))
+            if len(out) >= MAERSK_MAX_COUNTRIES:
+                print(f"    [maersk] hit the {MAERSK_MAX_COUNTRIES}-country safety cap - "
+                      f"stopping discovery early. This should never happen for real "
+                      f"country links; if it does, the noise filter above needs "
+                      f"another look.")
+                return out
     return out
 
 
