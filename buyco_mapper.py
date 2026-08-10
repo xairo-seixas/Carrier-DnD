@@ -692,13 +692,35 @@ def parse_date_best_effort(value) -> Optional["__import__('datetime').date"]:
         return None
 
 
+def _norm_key_field(value) -> str:
+    """Normalizes a key field so blank values always compare equal.
+
+    Root cause this exists for: openpyxl silently turns an empty-string cell
+    value into None the moment the workbook is saved and reloaded (confirmed
+    directly - write "" to a cell, save, reload, and cell.value comes back
+    as None, not ""). MappedRow fields default to "" (e.g. Maersk rows never
+    set container_type, so it's always ""). A freshly built row_key() from
+    this run's MappedRow objects would have container_type == "", while the
+    SAME field read back from a workbook that was saved/reloaded (i.e. every
+    existing row, every run - the master comes from Google Drive each time)
+    comes back as None. "" != None, so every Maersk row's key mismatched on
+    every subsequent run and looked brand-new every time - confirmed as the
+    cause of the duplicate 172-row Maersk batches. Routing every key field
+    through this normalizer (on both the "existing rows in the file" side and
+    the "freshly computed from this run" side) makes None and "" the same
+    key value, so a genuine match is found instead of a phantom new row.
+    """
+    return "" if value in (None, "") else value
+
+
 def row_key(mrow: "MappedRow") -> tuple:
     # Container type is part of the identity now that CMA rows are split per
     # size/equipment type (20DV vs 40DV vs 20RFR, etc.) - without it, two
     # rows for the same port/penalty that only differ by size would look
     # identical to the matcher and collide.
     port = mrow.pod if mrow.type_ == "Destination" else mrow.pol
-    return (mrow.carrier, mrow.type_, port, mrow.penalty_type, mrow.container_type)
+    return tuple(_norm_key_field(v) for v in
+                 (mrow.carrier, mrow.type_, port, mrow.penalty_type, mrow.container_type))
 
 
 def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
@@ -740,7 +762,8 @@ def upsert_template(template_path: Path, docs: list, out_path: Path) -> dict:
         if not type_ or not carrier:
             continue
         port = pod if type_ == "Destination" else pol
-        existing_index[(carrier, type_, port, penalty_type, container_type)] = r
+        existing_index[tuple(_norm_key_field(v) for v in
+                              (carrier, type_, port, penalty_type, container_type))] = r
 
     next_row = last_row + 1
     appended = 0
