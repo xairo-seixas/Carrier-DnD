@@ -94,7 +94,17 @@ jobs:
       # exactly this reason - the runner's own Python (whatever `python3`
       # resolves to on the laptop) is used directly instead.
       - name: Install dependencies
-        run: pip3 install -r requirements.txt
+        # pip 21.2.4 (what ships with this laptop's Python 3.9) is too old to
+        # resolve the prebuilt wheel for `cryptography` (pulled in by
+        # google-auth) on this Mac, so it fell back to compiling it from
+        # source - which then failed because there's no Rust/OpenSSL dev
+        # toolchain installed (confirmed in the earlier failed run's logs:
+        # "maturin failed", "Could not find directory of OpenSSL
+        # installation"). Upgrading pip first fixes the wheel resolution so
+        # nothing needs to compile at all.
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
 
       - name: Install Playwright's Chromium
         # No --with-deps here (that flag installs Linux system packages via
