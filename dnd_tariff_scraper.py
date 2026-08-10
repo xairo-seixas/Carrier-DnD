@@ -35,6 +35,17 @@ The site structure it targets (confirmed by inspection on 2026-08-03):
     for the US only and assumed elsewhere.
 Run with --sample 5 first and inspect output/logs before a full run.
 """
+# This laptop runs Python 3.9 (confirmed via `python3 --version` on the
+# self-hosted runner), which doesn't support the `int | None` union syntax
+# used throughout this file's type hints (that's a 3.10+ feature - PEP 604).
+# Without this import, just loading the module raises
+# "TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'" at
+# the first `def ...(x: int | None = None)` it hits (confirmed in a real
+# run's traceback, at discover_cma_cgm's signature). `from __future__ import
+# annotations` defers all annotations to plain strings instead of evaluating
+# them at def-time, so the `|` is never actually executed - works on
+# Python 3.7+, no behavior change on newer versions.
+from __future__ import annotations
 import argparse
 import csv
 import io
