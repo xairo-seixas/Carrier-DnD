@@ -109,7 +109,17 @@ jobs:
       - name: Install Playwright's Chromium
         # No --with-deps here (that flag installs Linux system packages via
         # apt-get and fails/is irrelevant on macOS) - just the browser binary.
-        run: playwright install chromium
+        #
+        # Invoked as `python3 -m playwright` rather than the bare `playwright`
+        # command: pip installed everything to this user's site-packages
+        # (`Defaulting to user installation because normal site-packages is
+        # not writeable` - the system Python's own site-packages is
+        # protected), which puts the `playwright` console script in a user
+        # bin directory (e.g. ~/Library/Python/3.9/bin) that isn't on the
+        # runner's PATH - confirmed by "playwright: command not found" in the
+        # previous run. Running it as a module sidesteps PATH entirely since
+        # python3 already knows where its own installed packages are.
+        run: python3 -m playwright install chromium
 
       - name: Run monthly refresh
         env:
