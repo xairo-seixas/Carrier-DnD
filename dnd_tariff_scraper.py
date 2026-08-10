@@ -132,7 +132,24 @@ def _get_browser_context():
     if _browser_context is None:
         from playwright.sync_api import sync_playwright
         _browser_playwright = sync_playwright().start()
-        _browser_instance = _browser_playwright.chromium.launch(headless=True)
+        # headless=False on purpose, confirmed necessary by a direct real-world
+        # test (2026-08-10): a plain requests.get() from this same laptop's
+        # network got Cloudflare's "enable JS" challenge (403) on
+        # cma-cgm.com, and so did headless Chromium - but a real Chromium
+        # window (headless=False), same browser, same network, got the real
+        # page (1.1MB of actual markup, not the challenge). That isolates the
+        # block to something about headless mode's fingerprint specifically
+        # (not the network, not "any automation") - so this runs a real,
+        # visible browser instead. It's the same client a person uses
+        # manually, just automated instead of clicked - not a spoofed or
+        # impersonated fingerprint.
+        #
+        # Caveat: this needs an active logged-in GUI session on the laptop to
+        # render a window - it won't work over a plain SSH session with no
+        # display, and if this runner is ever converted to a background
+        # service (svc.sh install), the laptop still needs to stay logged in
+        # (screen can be locked, just not logged out) for this to keep working.
+        _browser_instance = _browser_playwright.chromium.launch(headless=False)
         _browser_context = _browser_instance.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1366, "height": 900},
