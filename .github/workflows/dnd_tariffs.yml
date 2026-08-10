@@ -82,12 +82,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
+      # No actions/setup-python here on purpose. That action manages a
+      # per-version Python install under a "hostedtoolcache" folder that,
+      # on GitHub's own hosted runners, lives at /Users/runner/hostedtoolcache
+      # - a path that only exists because GitHub provisions that exact user
+      # on hosted macOS images. On a self-hosted runner (this laptop) that
+      # path doesn't exist and the account running the job has no permission
+      # to create /Users/runner, so the step fails with "mkdir: /Users/runner:
+      # Permission denied" (confirmed in run #18's logs). GitHub's own
+      # setup-python docs say to skip this action on self-hosted runners for
+      # exactly this reason - the runner's own Python (whatever `python3`
+      # resolves to on the laptop) is used directly instead.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip3 install -r requirements.txt
 
       - name: Install Playwright's Chromium
         # No --with-deps here (that flag installs Linux system packages via
