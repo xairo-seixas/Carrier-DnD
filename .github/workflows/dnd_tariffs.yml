@@ -24,9 +24,52 @@ name: D&D Tariff Monthly Refresh
 # Drive-API automation).
 #
 # Uses a real headless browser (Playwright/Chromium) to fetch carrier pages
-# instead of plain HTTP requests - cma_cgm/hapag_lloyd/msc all 403'd bare
-# requests.get() calls from GitHub Actions' IPs (bot protection), so this
-# installs Chromium in CI the same way terminal-extractor's workflow does.
+# instead of plain HTTP requests - a bare requests.get() call gets 403'd
+# from GitHub Actions' IPs. Confirmed that gets Maersk through fine.
+#
+# CMA CGM (and, still unresolved, Hapag-Lloyd and MSC) sit behind Cloudflare/
+# WAF bot protection that specifically blocks GitHub Actions' hosted-runner
+# IP ranges (a "Just a moment..." JS challenge or a hard "Access Denied",
+# confirmed on both a raw request and a full headless-browser page render) -
+# no client-side fetch trick fixes that, and deliberately engineering one
+# would just be bypassing the site's bot-detection, which isn't something to
+# build regardless of feasibility.
+#
+# Fix: this job runs on a SELF-HOSTED runner (a BuyCo laptop) instead of
+# GitHub's hosted ubuntu-latest runners. That's a legitimately different
+# thing, not a workaround - it's the same request a normal employee's
+# browser would make, from a normal (non-datacenter, non-scraper-flagged)
+# network, same as manually visiting the site would be. See "Self-hosted
+# runner setup" below for how to register the laptop.
+#
+# CMA CGM still has a manual-drop Drive folder as a fallback (not the only
+# path anymore) - if live discovery ever comes back empty (e.g. the laptop
+# was offline when the schedule fired and this run went to a hosted runner,
+# or CMA CGM's protection changes again), the run reads whatever's in that
+# folder instead of producing nothing for that carrier that month.
+#   CMA_CGM_MANUAL_FOLDER_ID - Drive folder ID for that drop folder
+#                             (optional - if unset and live discovery finds
+#                             nothing, CMA CGM is just skipped for the run
+#                             with a clear message). The service account
+#                             needs at least Viewer access on this folder.
+#
+# --- Self-hosted runner setup (one-time, on the BuyCo laptop) ---
+#   1. Repo -> Settings -> Actions -> Runners -> "New self-hosted runner".
+#   2. Pick macOS, and run the commands GitHub shows you in a Terminal on
+#      the laptop (downloads the runner, then `./config.sh --url ... --token ...`
+#      using the URL/token GitHub generates for you there).
+#   3. Install it as a background service so it's always listening, not
+#      just while a Terminal window happens to be open:
+#        sudo ./svc.sh install
+#        sudo ./svc.sh start
+#   4. That's it - once registered, this workflow (runs-on: self-hosted)
+#      will dispatch to that laptop automatically, both for the monthly
+#      schedule and for manual "Run workflow" triggers.
+#   Caveat: the laptop needs to be powered on and online for the monthly
+#   cron trigger to actually run - if it's asleep/off at 06:00 UTC on the
+#   1st, that scheduled run simply won't fire on it. workflow_dispatch
+#   (manual trigger) always works whenever the laptop's runner is online,
+#   so a quick manual run is the catch-up path for a missed month.
 
 on:
   schedule:
@@ -35,7 +78,7 @@ on:
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
@@ -47,14 +90,16 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install Playwright's Chromium
-        run: playwright install --with-deps chromium
+        # No --with-deps here (that flag installs Linux system packages via
+        # apt-get and fails/is irrelevant on macOS) - just the browser binary.
+        run: playwright install chromium
 
       - name: Run monthly refresh
         env:
           GDRIVE_FILE_ID: ${{ secrets.GDRIVE_FILE_ID }}
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
           CMA_CGM_MANUAL_FOLDER_ID: ${{ secrets.CMA_CGM_MANUAL_FOLDER_ID }}
-        run: python run_monthly.py
+        run: python3 run_monthly.py
 
       - name: Upload run logs on failure
         if: failure()
