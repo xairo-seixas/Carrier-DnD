@@ -201,49 +201,73 @@ def discover_manual_pdfs(svc, folder_id: str, carrier: str) -> list[TariffDoc]:
 
 
 def scrape_all_carriers(svc) -> tuple[list, list[str]]:
+    """Runs every carrier's live discovery first. For carriers in
+    MANUAL_DROP_CARRIERS, live discovery failing or coming back with 0 docs
+    falls through to that carrier's manual-drop Drive folder (if one is
+    configured) as a backstop - not the only path anymore.
+
+    Why the fallback still exists even now that this can run from a normal
+    (non-datacenter) network: it costs nothing to keep it as a safety net
+    for a month where the runner machine happens to be off, asleep, or
+    offline when the schedule fires - the folder still has last month's (or
+    a manually refreshed) set of PDFs to fall back on rather than the run
+    producing nothing for that carrier at all.
+    """
     all_docs = []
     failures = []
     try:
         for carrier, discover_fn in CARRIERS.items():
             print(f"\n── {carrier} ──")
 
-            if carrier in MANUAL_DROP_CARRIERS:
-                folder_id = os.environ.get(MANUAL_DROP_CARRIERS[carrier])
-                if not folder_id:
-                    print(f"  Skipped - {carrier}'s site blocks automated access and "
-                          f"{MANUAL_DROP_CARRIERS[carrier]} isn't set, so there's no "
-                          f"manual-drop folder to read from this month.")
-                    failures.append(f"{carrier}: skipped - no manual-drop folder configured")
-                    continue
-                try:
-                    docs = discover_manual_pdfs(svc, folder_id, carrier)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  ✗ manual-drop folder read failed: {exc}")
-                    failures.append(f"{carrier}: manual-drop folder read failed: {exc}")
-                    continue
-                print(f"  Found {len(docs)} PDF(s) in the manual-drop folder")
-                for i, doc in enumerate(docs, 1):
-                    status = "✓" if doc.status != "failed" else "✗"
-                    print(f"    [{i}/{len(docs)}] {status} {doc.title}")
-                all_docs.extend(docs)
-                if not docs:
-                    failures.append(f"{carrier}: 0 PDFs found in the manual-drop folder this run")
-                continue
-
+            docs = []
+            live_error = None
             try:
                 docs = discover_fn(None)
             except Exception as exc:  # noqa: BLE001
-                print(f"  ✗ discovery failed: {exc}")
-                failures.append(f"{carrier}: discovery failed: {exc}")
+                live_error = exc
+                print(f"  ✗ live discovery failed: {exc}")
+
+            if docs:
+                print(f"  Discovered {len(docs)} document(s)")
+                for i, doc in enumerate(docs, 1):
+                    fetch_and_parse_pdf(doc)
+                    status = "✓" if doc.status != "failed" else "✗"
+                    print(f"    [{i}/{len(docs)}] {status} {doc.country} — {doc.title}")
+                all_docs.extend(docs)
                 continue
-            print(f"  Discovered {len(docs)} document(s)")
-            for i, doc in enumerate(docs, 1):
-                fetch_and_parse_pdf(doc)
+
+            if carrier not in MANUAL_DROP_CARRIERS:
+                failures.append(
+                    f"{carrier}: discovery failed: {live_error}" if live_error
+                    else f"{carrier}: 0 documents discovered this run"
+                )
+                continue
+
+            # Live discovery found nothing (or errored) and this carrier has
+            # a manual-drop fallback configured - try that before giving up.
+            folder_id = os.environ.get(MANUAL_DROP_CARRIERS[carrier])
+            if not folder_id:
+                msg = (f"{carrier}: live discovery found 0 docs"
+                       + (f" ({live_error})" if live_error else "")
+                       + f", and {MANUAL_DROP_CARRIERS[carrier]} isn't set - no fallback available")
+                print(f"  {msg}")
+                failures.append(msg)
+                continue
+            try:
+                manual_docs = discover_manual_pdfs(svc, folder_id, carrier)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ✗ manual-drop folder read failed: {exc}")
+                failures.append(f"{carrier}: live discovery found 0 docs and manual-drop "
+                                 f"folder read failed: {exc}")
+                continue
+            print(f"  Live discovery found 0 docs - fell back to manual-drop folder: "
+                  f"found {len(manual_docs)} PDF(s)")
+            for i, doc in enumerate(manual_docs, 1):
                 status = "✓" if doc.status != "failed" else "✗"
-                print(f"    [{i}/{len(docs)}] {status} {doc.country} — {doc.title}")
-            all_docs.extend(docs)
-            if not docs:
-                failures.append(f"{carrier}: 0 documents discovered this run")
+                print(f"    [{i}/{len(manual_docs)}] {status} {doc.title}")
+            all_docs.extend(manual_docs)
+            if not manual_docs:
+                failures.append(f"{carrier}: 0 documents found via live discovery or manual-drop folder")
     finally:
         close_browser()  # always shut the headless browser down, even on failure
     return all_docs, failures
